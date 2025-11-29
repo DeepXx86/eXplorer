@@ -57,7 +57,6 @@ struct ExplorerApp {
     search_files: bool,
     search_folders: bool,
     data_folder: PathBuf,
-    index_loaded_from_cache: bool,
     index_total_count: usize,
     show_indexing_progress: bool,
     selected_entries: HashSet<PathBuf>,
@@ -66,6 +65,8 @@ struct ExplorerApp {
     context_menu_entry: Option<FileEntry>,
     context_menu_pos: egui::Pos2,
     context_menu_just_opened: bool,
+    history_back: Vec<PathBuf>,
+    history_forward: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -290,10 +291,8 @@ impl ExplorerApp {
             return;
         }
 
-        if !self.index_loaded_from_cache {
-            self.home_index.clear();
-            self.home_index.shrink_to_fit();
-        }
+        self.home_index.clear();
+        self.home_index.shrink_to_fit();
 
         let (tx, rx) = mpsc::channel();
         self.home_index_rx = Some(rx);
@@ -432,7 +431,6 @@ impl ExplorerApp {
             self.show_indexing_progress = false;
             self.index_total_count = self.home_index.len();
             self.home_index.shrink_to_fit();
-            self.index_loaded_from_cache = false;
             self.save_home_index();
         }
         
@@ -521,11 +519,9 @@ impl ExplorerApp {
         }
 
         if updated && !self.is_at_home() && !self.local_last_query.is_empty() {
-            if drop_receiver || self.local_index.len() % 1000 < MAX_INDEX_UPDATES_PER_FRAME {
-                self.local_results_cache = self.filter_local_index(&self.local_last_query);
-                self.filtered_entries = self.local_results_cache.clone();
-                Self::sort_entries(&mut self.filtered_entries, &self.size_cache);
-            }
+            self.local_results_cache = self.filter_local_index(&self.local_last_query);
+            self.filtered_entries = self.local_results_cache.clone();
+            Self::sort_entries(&mut self.filtered_entries, &self.size_cache);
         }
     }
 
@@ -588,7 +584,6 @@ impl ExplorerApp {
             search_files: true,
             search_folders: true,
             data_folder: PathBuf::new(),
-            index_loaded_from_cache: false,
             index_total_count: 0,
             show_indexing_progress: false,
             selected_entries: HashSet::new(),
@@ -597,6 +592,8 @@ impl ExplorerApp {
             context_menu_entry: None,
             context_menu_pos: egui::Pos2::ZERO,
             context_menu_just_opened: false,
+            history_back: Vec::new(),
+            history_forward: Vec::new(),
         };
         
         app.data_folder = Self::get_data_folder();
@@ -606,13 +603,9 @@ impl ExplorerApp {
         
         if let Some(cached_index) = Self::load_home_index(&app.data_folder) {
             app.home_index = cached_index;
-            app.index_loaded_from_cache = true;
             app.index_total_count = app.home_index.len();
-            app.start_home_indexing();
-        } else {
-            app.show_indexing_progress = true;
-            app.start_home_indexing();
         }
+        app.start_home_indexing();
         
         app.refresh();
         app
@@ -684,6 +677,11 @@ impl ExplorerApp {
 
     fn go_to(&mut self, path: PathBuf) {
         let current_dir = PathBuf::from(&self.current_path);
+        if current_dir != path {
+            self.history_back.push(current_dir.clone());
+            self.history_forward.clear();
+        }
+        
         if current_dir.is_dir() {
             let all_sizes_known = self.entries.iter().all(|e| e.size.is_some());
             if all_sizes_known {
@@ -713,6 +711,26 @@ impl ExplorerApp {
         
         self.current_path = path.to_string_lossy().to_string();
         self.refresh();
+    }
+    
+    fn go_back(&mut self) {
+        if let Some(prev_path) = self.history_back.pop() {
+            let current = PathBuf::from(&self.current_path);
+            self.history_forward.push(current);
+            self.current_path = prev_path.to_string_lossy().to_string();
+            self.selected_entries.clear();
+            self.refresh();
+        }
+    }
+    
+    fn go_forward(&mut self) {
+        if let Some(next_path) = self.history_forward.pop() {
+            let current = PathBuf::from(&self.current_path);
+            self.history_back.push(current);
+            self.current_path = next_path.to_string_lossy().to_string();
+            self.selected_entries.clear();
+            self.refresh();
+        }
     }
 
     fn start_size_worker(&mut self) {
@@ -852,9 +870,25 @@ impl eframe::App for ExplorerApp {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("📂 Path").strong().size(14.0));
+                let back_enabled = !self.history_back.is_empty();
+                if ui.add_enabled(back_enabled, egui::Button::new("◀")).on_hover_text("Back").clicked() {
+                    self.go_back();
+                }
+                let forward_enabled = !self.history_forward.is_empty();
+                if ui.add_enabled(forward_enabled, egui::Button::new("▶")).on_hover_text("Forward").clicked() {
+                    self.go_forward();
+                } 
+                if ui.button("⬆").on_hover_text("Up").clicked() {
+                    if let Some(parent) = PathBuf::from(&self.current_path).parent() {
+                        self.go_to(parent.to_path_buf());
+                    }
+                }
+                
+                ui.separator();
+                
+                ui.label(egui::RichText::new("📂").size(14.0));
                 let path_edit = egui::TextEdit::singleline(&mut self.current_path)
-                    .desired_width(ui.available_width() - 110.0)
+                    .desired_width(ui.available_width() - 50.0)
                     .font(egui::TextStyle::Monospace);
                 let resp = ui.add(path_edit);
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -862,12 +896,6 @@ impl eframe::App for ExplorerApp {
                 }
                 if ui.button("Go").clicked() {
                     self.refresh();
-                }
-                if ui.button("⬆ Up").clicked() {
-                    if let Some(parent) = PathBuf::from(&self.current_path).parent() {
-                        self.current_path = parent.to_string_lossy().to_string();
-                        self.refresh();
-                    }
                 }
             });
             
@@ -901,6 +929,12 @@ impl eframe::App for ExplorerApp {
                 if ui.button("Clear").clicked() {
                     self.search_query.clear();
                     self.update_filtered_entries();
+                }
+                
+                // Show scanning indicator
+                if self.local_index_scanning {
+                    ui.spinner();
+                    ui.label(format!("Scanning... ({})", self.local_index.len()));
                 }
             });
             ui.add_space(4.0);
@@ -1031,9 +1065,17 @@ impl eframe::App for ExplorerApp {
                             let name = bookmark.file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("Unknown");
+                            let is_dir = bookmark.is_dir();
+                            let icon = if is_dir { "📁" } else { "📄" };
                             ui.horizontal(|ui| {
-                                if ui.selectable_label(false, format!("📁 {}", name)).clicked() {
-                                    navigate_to = Some(bookmark.clone());
+                                if ui.selectable_label(false, format!("{} {}", icon, name)).clicked() {
+                                    if is_dir {
+                                        navigate_to = Some(bookmark.clone());
+                                    } else {
+                                        if let Err(e) = open_entry(&bookmark) {
+                                            self.error = Some(format!("Failed to open: {}", e));
+                                        }
+                                    }
                                 }
                                 if ui.small_button("✖").on_hover_text("Remove bookmark").clicked() {
                                     remove_bookmark = Some(bookmark.clone());
