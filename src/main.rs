@@ -62,6 +62,10 @@ struct ExplorerApp {
     show_indexing_progress: bool,
     selected_entries: HashSet<PathBuf>,
     confirm_delete_multi: bool,
+    bookmarks: Vec<PathBuf>,
+    context_menu_entry: Option<FileEntry>,
+    context_menu_pos: egui::Pos2,
+    context_menu_just_opened: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +132,42 @@ impl ExplorerApp {
     
     fn index_file_path(data_folder: &Path) -> PathBuf {
         data_folder.join("home_index.dat")
+    }
+    
+    fn bookmarks_file_path(data_folder: &Path) -> PathBuf {
+        data_folder.join("bookmarks.dat")
+    }
+    
+    fn load_bookmarks(data_folder: &Path) -> Vec<PathBuf> {
+        if let Ok(content) = fs::read_to_string(Self::bookmarks_file_path(data_folder)) {
+            content.lines()
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from)
+                .filter(|p| p.exists())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+    
+    fn save_bookmarks(&self) {
+        let content: String = self.bookmarks.iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = fs::write(Self::bookmarks_file_path(&self.data_folder), content);
+    }
+    
+    fn add_bookmark(&mut self, path: PathBuf) {
+        if !self.bookmarks.contains(&path) {
+            self.bookmarks.push(path);
+            self.save_bookmarks();
+        }
+    }
+    
+    fn remove_bookmark(&mut self, path: &PathBuf) {
+        self.bookmarks.retain(|p| p != path);
+        self.save_bookmarks();
     }
     
     fn load_cache(data_folder: &Path) -> HashMap<PathBuf, u64> {
@@ -508,14 +548,10 @@ impl ExplorerApp {
     }
 
     fn sort_entries(entries: &mut Vec<FileEntry>, cache: &HashMap<PathBuf, u64>) {
-        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => {
-                let size_a = a.size.or_else(|| cache.get(&a.path).copied()).unwrap_or(0);
-                let size_b = b.size.or_else(|| cache.get(&b.path).copied()).unwrap_or(0);
-                size_b.cmp(&size_a)
-            }
+        entries.sort_by(|a, b| {
+            let size_a = a.size.or_else(|| cache.get(&a.path).copied()).unwrap_or(0);
+            let size_b = b.size.or_else(|| cache.get(&b.path).copied()).unwrap_or(0);
+            size_b.cmp(&size_a)
         });
     }
 
@@ -557,9 +593,14 @@ impl ExplorerApp {
             show_indexing_progress: false,
             selected_entries: HashSet::new(),
             confirm_delete_multi: false,
+            bookmarks: Vec::new(),
+            context_menu_entry: None,
+            context_menu_pos: egui::Pos2::ZERO,
+            context_menu_just_opened: false,
         };
         
         app.data_folder = Self::get_data_folder();
+        app.bookmarks = Self::load_bookmarks(&app.data_folder);
         
         app.size_cache = Self::load_cache(&app.data_folder);
         
@@ -870,6 +911,7 @@ impl eframe::App for ExplorerApp {
         });
 
         let mut navigate_to: Option<PathBuf> = None;
+        let mut remove_bookmark: Option<PathBuf> = None;
 
         egui::SidePanel::left("drive_panel")
             .resizable(true)
@@ -978,6 +1020,27 @@ impl eframe::App for ExplorerApp {
                             }
                         }
                     }
+                    
+                    if !self.bookmarks.is_empty() {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.label(egui::RichText::new("📌 Bookmarks").strong());
+                        
+                        let bookmarks_clone = self.bookmarks.clone();
+                        for bookmark in &bookmarks_clone {
+                            let name = bookmark.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("Unknown");
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(false, format!("📁 {}", name)).clicked() {
+                                    navigate_to = Some(bookmark.clone());
+                                }
+                                if ui.small_button("✖").on_hover_text("Remove bookmark").clicked() {
+                                    remove_bookmark = Some(bookmark.clone());
+                                }
+                            });
+                        }
+                    }
                 });
             });
 
@@ -1013,13 +1076,14 @@ impl eframe::App for ExplorerApp {
                     TableBuilder::new(ui)
                         .striped(true)
                         .resizable(true)
+                        .vscroll(true)
                         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                        .column(Column::auto().at_least(60.0).resizable(true))
-                        .column(Column::initial(250.0).at_least(100.0).resizable(true))
-                        .column(Column::auto().at_least(70.0).resizable(true))
-                        .column(Column::auto().at_least(80.0).resizable(true))
-                        .column(Column::auto().at_least(140.0).resizable(true))
-                        .column(Column::remainder().at_least(100.0).resizable(true))
+                        .column(Column::exact(60.0))
+                        .column(Column::exact(250.0))
+                        .column(Column::exact(70.0))
+                        .column(Column::exact(100.0))
+                        .column(Column::exact(150.0))
+                        .column(Column::remainder().at_least(100.0))
                         .header(24.0, |mut header| {
                             header.col(|ui| {
                                 ui.strong("Type");
@@ -1213,16 +1277,86 @@ impl eframe::App for ExplorerApp {
             self.go_to(path);
         }
         
+        if let Some(path) = remove_bookmark {
+            self.remove_bookmark(&path);
+        }
+        
+        if let Some(entry) = self.context_menu_entry.clone() {
+            let mut close_menu = false;
+            let popup_id = egui::Id::new("context_menu_popup");
+            
+            let response = egui::Area::new(popup_id)
+                .fixed_pos(self.context_menu_pos)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(150.0);
+                        
+                        let is_bookmarked = self.bookmarks.contains(&entry.path);
+                        if is_bookmarked {
+                            if ui.button("📌 Remove from Quick Access").clicked() {
+                                self.remove_bookmark(&entry.path);
+                                close_menu = true;
+                            }
+                        } else {
+                            if ui.button("📌 Add to Quick Access").clicked() {
+                                self.add_bookmark(entry.path.clone());
+                                close_menu = true;
+                            }
+                        }
+                        ui.separator();
+                        
+                        if ui.button("📋 Properties").clicked() {
+                            self.show_properties = Some(entry.clone());
+                            close_menu = true;
+                        }
+                        
+                        if ui.button("🗑 Delete").clicked() {
+                            self.confirm_delete = Some(entry.clone());
+                            close_menu = true;
+                        }
+                    });
+                });
+            
+            if self.context_menu_just_opened {
+                self.context_menu_just_opened = false;
+            } else {
+                let clicked_outside = ctx.input(|i| i.pointer.primary_clicked()) && !response.response.rect.contains(ctx.input(|i| i.pointer.interact_pos().unwrap_or(egui::Pos2::ZERO)));
+                if clicked_outside {
+                    close_menu = true;
+                }
+            }
+            
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                close_menu = true;
+            }
+            
+            if close_menu {
+                self.context_menu_entry = None;
+            }
+        }
+        
         if let Some(entry) = &self.show_properties.clone() {
             let mut close_dialog = false;
             let mut delete_file = false;
+            let mut toggle_bookmark = false;
+            let is_bookmarked = self.bookmarks.contains(&entry.path);
             
             egui::Window::new("Properties")
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.vertical(|ui| {
-                        ui.heading(entry.path.file_name().and_then(|n| n.to_str()).unwrap_or("Unknown"));
+                        ui.horizontal(|ui| {
+                            ui.heading(entry.path.file_name().and_then(|n| n.to_str()).unwrap_or("Unknown"));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let pin_icon = if is_bookmarked { "📌" } else { "📍" };
+                                let pin_hint = if is_bookmarked { "Remove from Quick Access" } else { "Add to Quick Access" };
+                                if ui.button(pin_icon).on_hover_text(pin_hint).clicked() {
+                                    toggle_bookmark = true;
+                                }
+                            });
+                        });
                         ui.separator();
                         
                         ui.horizontal(|ui| {
@@ -1275,6 +1409,14 @@ impl eframe::App for ExplorerApp {
                         });
                     });
                 });
+            
+            if toggle_bookmark {
+                if is_bookmarked {
+                    self.remove_bookmark(&entry.path);
+                } else {
+                    self.add_bookmark(entry.path.clone());
+                }
+            }
             
             if delete_file {
                 self.confirm_delete = Some(entry.clone());
